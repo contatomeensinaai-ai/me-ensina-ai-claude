@@ -1,0 +1,20 @@
+{
+  "version": "0.2.0",
+  "platforms": {
+    "darwin-arm64": {
+      "url": "https://github.com/contatomeensinaai-ai/me-ensina-ai-editor/releases/download/v0.2.0-pilot/Me-Ensina-AI-0.2.0-darwin-arm64.zip",
+      "sha256": "394922830470850c2b1d8c6c8f697a4706f556132a54ed9c1d17f8d4dac99147",
+      "packageDirectory": "Me-Ensina-AI-0.2.0-darwin-arm64"
+    },
+    "darwin-x64": {
+      "url": "https://github.com/contatomeensinaai-ai/me-ensina-ai-editor/releases/download/v0.2.0-pilot/Me-Ensina-AI-0.2.0-darwin-x64.zip",
+      "sha256": "6494856f5a786eb3dbaebaf3997f4d18d6e698d7435fa4d385d980f19919c2b2",
+      "packageDirectory": "Me-Ensina-AI-0.2.0-darwin-x64"
+    },
+    "win32-x64": {
+      "url": "https://github.com/contatomeensinaai-ai/me-ensina-ai-editor/releases/download/v0.2.0-pilot/Me-Ensina-AI-0.2.0-win32-x64.zip",
+      "sha256": "232faf83fbc467bf57bed95665329c9e0c43bfd6fea9fbd0384fe1fe28bccb91",
+      "packageDirectory": "Me-Ensina-AI-0.2.0-win32-x64"
+    }
+  }
+}

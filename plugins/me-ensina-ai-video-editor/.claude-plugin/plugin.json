@@ -1,0 +1,16 @@
+{
+  "name": "me-ensina-ai-video-editor",
+  "version": "2.1.1",
+  "description": "Editor local Me Ensina AI para Claude Code. Mac Apple Silicon, Mac Intel e Windows x64. Abre dentro da conversa.",
+  "author": {
+    "name": "Me Ensina AI"
+  },
+  "homepage": "https://github.com/contatomeensinaai-ai/me-ensina-ai-editor",
+  "repository": "https://github.com/contatomeensinaai-ai/me-ensina-ai-editor",
+  "license": "MIT",
+  "keywords": [
+    "video",
+    "editor",
+    "macos"
+  ]
+}

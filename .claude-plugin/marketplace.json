@@ -1,0 +1,16 @@
+{
+  "name": "me-ensina-ai-claude",
+  "owner": {
+    "name": "Me Ensina AI"
+  },
+  "metadata": {
+    "description": "Marketplace exclusivo Claude Code: Me Ensina AI Editor de Vídeo"
+  },
+  "plugins": [
+    {
+      "name": "me-ensina-ai-video-editor",
+      "source": "./plugins/me-ensina-ai-video-editor",
+      "description": "Editor de vídeo local que abre dentro da conversa do Claude Code. Mac Apple Silicon, Mac Intel e Windows x64."
+    }
+  ]
+}
