@@ -1,0 +1,10 @@
+{
+  "name": "lembrete-salva",
+  "version": "0.3.0",
+  "description": "Faixa que lembra de rodar o /salva quando faz 1 hora sem salvar. O botão Salvar agora faz cada conversa aberta no app rodar o /salva dela, uma de cada vez, e esta conversa salva por último.",
+  "types": "./types/index.d.ts",
+  "license": "MIT",
+  "author": {
+    "name": "Me Ensina AI"
+  }
+}

@@ -4,7 +4,7 @@
     "name": "Me Ensina AI"
   },
   "metadata": {
-    "description": "Marketplace exclusivo Claude Code da Me Ensina AI: Editor de Vídeo e o mod Tarefas do dono"
+    "description": "Marketplace exclusivo Claude Code da Me Ensina AI: Editor de Vídeo e os mods Tarefas do dono e Lembrete do salva"
   },
   "plugins": [
     {
@@ -16,6 +16,11 @@
       "name": "tarefas-do-dono",
       "source": "./plugins/tarefas-do-dono",
       "description": "Painel Suas tarefas ao lado do chat, com Ativar e Feito. Mesma lista em todas as conversas do computador."
+    },
+    {
+      "name": "lembrete-salva",
+      "source": "./plugins/lembrete-salva",
+      "description": "Faixa que lembra de salvar depois de 1 hora. Salvar agora roda o /salva de cada conversa aberta, uma de cada vez."
     }
   ]
 }
