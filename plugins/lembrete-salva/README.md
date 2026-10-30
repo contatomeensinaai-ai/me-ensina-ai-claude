@@ -2,7 +2,7 @@
 
 Mod do Claude Code (Me Ensina AI). Mostra uma faixa acima do campo de digitar quando faz 1 hora ou mais que o seu trabalho não vai pro GitHub e existe arquivo alterado ou commit sem enviar.
 
-- **Salvar agora** faz cada conversa aberta no app rodar o `/salva` dela, uma de cada vez: manda o pedido para a primeira, espera ela responder e só então passa para a próxima. Quem já salvou na última hora responde que já está salva; conversa sem `/salva` ou sem GitHub responde e a fila segue. Quem não responde em 5 minutos fica para o próximo salvamento. A faixa mostra "Salvando em fila · 2 de 5 · agora: <conversa>" e o botão **Pular esta conversa**. No fim, esta conversa roda o `/salva` dela e um aviso resume quantas salvaram e quais ficaram de fora. Enquanto a fila roda, as outras conversas não oferecem um segundo Salvar agora.
+- **Salvar agora** monta uma fila com as conversas abertas no app e salva uma de cada vez. Nenhuma conversa manda mensagem para outra: a fila fica guardada no próprio mod, que todas as conversas leem, e o mod de cada conversa roda o `/salva` dela quando chega a vez. Conversa que já rodou o `/salva` na última hora passa a vez sem rodar de novo; conversa sem `/salva` ou sem GitHub também passa. Enquanto o `/salva` de uma conversa roda, ela avisa que está viva e a fila espera o tempo que for; conversa que some (fechada ou travada) por 5 minutos fica para o próximo salvamento. A faixa de quem clicou mostra "Salvando em fila · 2 de 5 · agora: <conversa>" e o botão **Pular esta conversa**; a conversa da vez mostra "Salvando esta conversa (fila)". No fim, quem clicou roda o `/salva` dela e um aviso resume quantas salvaram e quais ficaram de fora. Enquanto a fila roda, as outras conversas não oferecem um segundo Salvar agora.
 - **Depois** esconde a faixa por 30 minutos.
 - Quando um `git push` dá certo, aparece o aviso "Salvo no GitHub".
 
@@ -20,4 +20,4 @@ No terminal, dentro do Claude Code:
 /plugin install lembrete-salva --marketplace contatomeensinaai-ai/me-ensina-ai-claude
 ```
 
-Responda `y` para adicionar o marketplace e escolha o escopo de usuário. Depois abra uma conversa nova: as conversas que já estavam abertas não carregam o mod.
+Responda `y` para adicionar o marketplace e escolha o escopo de usuário. Depois abra uma conversa nova: as conversas que já estavam abertas não carregam o mod. Instalado uma vez, o mod roda em todas as conversas, e a fila precisa disso: reabra as conversas que estavam abertas depois de instalar ou atualizar, senão elas ficam sem resposta na fila.

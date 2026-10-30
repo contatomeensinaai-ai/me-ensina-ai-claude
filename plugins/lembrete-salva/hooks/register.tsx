@@ -1,20 +1,28 @@
 import { atom, read, update } from 'claude-code'
 import type { Register } from 'claude-code'
 
-import type { FilaAtiva, Git, Resultado, Rodada } from '../types'
+import type { FilaSalva, Git, Resultado, Vaga } from '../types'
 
 const MIN = 60_000
 const AVISA_DEPOIS = 60 * MIN
 const ADIA = 30 * MIN
 const ESPERA = 5 * MIN
+// Fila sem ninguém mexendo há tanto tempo: quem começou foi fechado.
+const ABANDONADA = 15 * MIN
+const TIQUE = 5_000
+const CHAVE = 'filaSalva'
 
 const git = atom({ plugin: 'lembrete-salva', key: 'git' } as const, { isRepo: false, dirty: 0, ahead: 0, upstreamAt: 0 })
 const startedAt = atom({ plugin: 'lembrete-salva', key: 'startedAt' } as const, 0)
 const savedAt = atom({ plugin: 'lembrete-salva', key: 'savedAt' } as const, 0)
 const snoozeUntil = atom({ plugin: 'lembrete-salva', key: 'snoozeUntil' } as const, 0)
 const now = atom({ plugin: 'lembrete-salva', key: 'now' } as const, 0)
-const rodada = atom({ plugin: 'lembrete-salva', key: 'rodada' } as const, null)
-const outraFila = atom({ plugin: 'lembrete-salva', key: 'outraFila' } as const, 0)
+const filaVista = atom({ plugin: 'lembrete-salva', key: 'fila' } as const, null)
+const meuRef = atom({ plugin: 'lembrete-salva', key: 'meuRef' } as const, '')
+const meuToken = atom({ plugin: 'lembrete-salva', key: 'meuToken' } as const, '')
+const ultimoSalva = atom({ plugin: 'lembrete-salva', key: 'ultimoSalva' } as const, 0)
+// /salva desta conversa há menos que isso: a vez dela na fila passa como "já salvo".
+const SALVOU_HA_POUCO = 60 * MIN
 
 type Api = Parameters<Parameters<Parameters<Register>[0]>[1]>[0]
 
@@ -49,9 +57,6 @@ async function atualizar($: Api) {
   await update($, git, () => g)
   const t = await $.clock.now()
   await update($, now, () => t)
-  // Fila de outra conversa: a marca fica no $.store, que todas as conversas leem.
-  const f = (await $.store.get('filaAtiva')) as FilaAtiva | null | undefined
-  await update($, outraFila, () => (f && typeof f.ate === 'number' ? f.ate : 0))
   return g
 }
 
@@ -67,77 +72,89 @@ function pendente(g: Git) {
 
 type Conversa = { name?: string; ref?: string; type?: string; status?: string }
 
-// As outras conversas abertas no app deste computador (fora as da nuvem e as desligadas).
-async function conversasAbertas($: Api): Promise<string[]> {
+// Quem esta conversa é e as outras abertas no app deste computador (fora as da nuvem e as desligadas).
+// O ListAgents não lista a própria conversa; o texto dele começa com "This session is <nome> [<ref>]".
+async function listar($: Api): Promise<{ eu: string; outras: Vaga[] }> {
   try {
-    const r = await $.tool.call({ tool: 'ListAgents' })
-    const secoes = ((r as { result?: { sections?: { rows?: Conversa[] }[] } }).result?.sections ?? [])
-    return secoes
+    const r = (await $.tool.call({ tool: 'ListAgents' })) as {
+      text?: string
+      result?: { listing?: string; text?: string; sections?: { rows?: Conversa[] }[] }
+    }
+    const texto = `${r.result?.listing ?? ''}\n${r.result?.text ?? ''}\n${r.text ?? ''}`
+    const eu = texto.match(/This session is .*\[([0-9a-f]+)\]/)?.[1] ?? ''
+    if (eu) await update($, meuRef, () => eu)
+    const outras = (r.result?.sections ?? [])
       .flatMap(s => s.rows ?? [])
-      .filter(c => c.name && /desktop|interactive/i.test(c.type ?? '') && c.status !== 'offline')
-      .map(c => (c.ref ? `${c.name} [${c.ref}]` : String(c.name)))
+      .filter(c => c.name && c.ref && c.ref !== eu && /desktop|interactive/i.test(c.type ?? '') && c.status !== 'offline')
+      .map(c => ({ ref: String(c.ref), nome: String(c.name) }))
+    return { eu, outras }
   } catch {
-    return []
+    return { eu: '', outras: [] }
   }
 }
 
-// A rodada que a v1 guardou não tem fila: não serve.
-function valida(x: unknown): Rodada | null {
-  const r = x as Rodada | null | undefined
-  return r && Array.isArray(r.fila) && Array.isArray(r.resultados) ? r : null
+let ultimaBusca = -Infinity
+
+// O ref desta conversa: guardado; se faltar, pergunta ao ListAgents no máximo uma vez por minuto.
+async function quemSou($: Api, t: number): Promise<string> {
+  const eu = await read($, meuRef)
+  if (eu || t - ultimaBusca < MIN) return eu
+  ultimaBusca = t
+  return (await listar($)).eu
 }
 
-async function lerRodada($: Api): Promise<Rodada | null> {
-  return valida(await read($, rodada))
+// A fila do store; o que a v0.3 guardou (a marca filaAtiva, a rodada no estado) não é lido.
+function valida(x: unknown): FilaSalva | null {
+  const f = x as FilaSalva | null | undefined
+  return f &&
+    typeof f.token === 'string' &&
+    Array.isArray(f.fila) &&
+    Array.isArray(f.resultados) &&
+    typeof f.atual === 'number' &&
+    typeof f.ateAtual === 'number'
+    ? f
+    : null
 }
 
-function nome(conversa: string) {
-  return conversa.replace(/ \[[^\]]*\]$/, '')
-}
-
-// Um código por posição da fila: resposta atrasada de uma conversa pulada não vale pra da vez.
-function codigo(r: Rodada) {
-  return `${r.token}-${r.atual}`
-}
-
-// Para onde as outras conversas respondem: o id local_ do app desktop, ou o da sessão fora dele.
-async function endereco($: Api): Promise<string> {
+async function lerFila($: Api): Promise<FilaSalva | null> {
   try {
-    return (await $.env.get('CLAUDE_CODE_HOST_SESSION_ID')) || (await $.session.id())
+    return valida(await $.store.get(CHAVE))
   } catch {
-    return ''
+    return null
   }
 }
 
-function pedido(cod: string, para: string) {
-  return (
-    `${cod} Pedido automático do lembrete do salva: as conversas abertas estão salvando uma de cada vez e agora é a sua vez. ` +
-    `Responda com a ferramenta SendMessage para a conversa que te mandou este pedido (o remetente desta mensagem; o endereço dela é "${para}"). ` +
-    `Se você rodou o /salva nesta conversa na última hora e nada mudou desde então, não rode e responda só "${cod}: já salvo". ` +
-    `Se a pasta desta conversa não tem o comando salva ou não tem GitHub, responda só "${cod}: sem salva aqui". ` +
-    `Senão, rode /salva lembrete (o argumento lembrete pula o passo do Hub) e, quando terminar, responda só "${cod}: pronto", ` +
-    `ou "${cod}: erro" e o motivo em poucas palavras se o envio pro GitHub falhou. ` +
-    `Se antes de começar chegar "${cod} cancelado", não rode o /salva.`
-  )
+async function guardarVista($: Api, f: FilaSalva | null) {
+  const antes = await read($, filaVista)
+  if (JSON.stringify(antes) !== JSON.stringify(f)) await update($, filaVista, () => f)
 }
 
-function cancelamento(cod: string) {
-  return `${cod} cancelado: não rode o /salva agora; o que você tem fica para o próximo salvamento.`
+// Lê de novo logo antes de escrever e só muda se a guarda ainda vale (o store não tem trava
+// entre processos; sobra uma janela pequena). Devolve a fila nova, null se apagou, ou
+// undefined se não mudou nada.
+async function mudarFila(
+  $: Api,
+  guarda: (f: FilaSalva) => boolean,
+  muda: (f: FilaSalva) => FilaSalva | null,
+): Promise<FilaSalva | null | undefined> {
+  const f = await lerFila($)
+  if (!f || !guarda(f)) return undefined
+  const nova = muda(f)
+  if (nova) await $.store.set(CHAVE, nova)
+  else await $.store.delete(CHAVE)
+  await guardarVista($, nova)
+  return nova
 }
 
-// Resposta de uma conversa da fila: começa pelo código e dois pontos.
-const RESPOSTA = /^\s*SALVA-[a-z0-9]+-\d+:/
+// A vez da conversa atual termina com `resposta` e passa pra próxima.
+function avancada(f: FilaSalva, resposta: string, t: number, motivo?: string): FilaSalva {
+  const r: Resultado = { conversa: f.fila[f.atual]?.nome ?? '', resposta }
+  if (motivo) r.motivo = motivo
+  return { ...f, resultados: [...f.resultados, r], atual: f.atual + 1, estado: 'esperando', ateAtual: t + ESPERA }
+}
 
-function classificar(texto: string): { resposta: string; motivo?: string } {
-  const corpo = texto.replace(/^[\s\S]*?SALVA-[a-z0-9]+-\d+:\s*/, '').trim()
-  if (/^já salvo\b/i.test(corpo)) return { resposta: 'já salvo' }
-  if (/^sem salva\b/i.test(corpo)) return { resposta: 'sem salva aqui' }
-  if (/^erro\b/i.test(corpo)) {
-    const motivo = corpo.replace(/^erro[\s:,.;-]*/i, '').trim()
-    return motivo ? { resposta: 'erro', motivo } : { resposta: 'erro' }
-  }
-  if (/^pronto\b/i.test(corpo)) return { resposta: 'pronto' }
-  return { resposta: 'resposta estranha' }
+function mesmaVez(f: FilaSalva, token: string, atual: number, estado?: FilaSalva['estado']) {
+  return f.token === token && f.atual === atual && f.atual < f.fila.length && (!estado || f.estado === estado)
 }
 
 function quantos(n: number, um: string, varios: string) {
@@ -149,8 +166,6 @@ const FORA: [string, string, string][] = [
   ['sem resposta', 'sem resposta', 'sem resposta'],
   ['erro', 'erro', 'erros'],
   ['pulada', 'pulada', 'puladas'],
-  ['não entregue', 'não entregue', 'não entregues'],
-  ['resposta estranha', 'resposta estranha', 'respostas estranhas'],
 ]
 
 function resumo(rs: Resultado[]) {
@@ -165,124 +180,194 @@ function resumo(rs: Resultado[]) {
   for (const [resposta, um, varios] of FORA) {
     const xs = de(resposta)
     if (xs.length)
-      partes.push(
-        `${quantos(xs.length, um, varios)}: ${xs.map(x => nome(x.conversa) + (x.motivo ? ` (${x.motivo})` : '')).join(', ')}`,
-      )
+      partes.push(`${quantos(xs.length, um, varios)}: ${xs.map(x => x.conversa + (x.motivo ? ` (${x.motivo})` : '')).join(', ')}`)
   }
   return `Salvamento em fila: ${partes.join(' · ')}`
 }
 
-let fim: { cancel: () => void } | undefined
-
-// O salva desta conversa, sempre com o argumento que pula o Hub.
-async function salvarEsta($: Api) {
+// O salva desta conversa, sempre com o argumento que pula o Hub. Fora de ganchos que o turno
+// espera: o engine recusa $.command.run lá dentro.
+async function rodarSalva($: Api) {
   const agora = await $.clock.now()
   await update($, savedAt, () => agora)
+  await $.command.run({ command: 'salva', args: 'lembrete' })
+}
+
+async function salvarEsta($: Api) {
   try {
-    await $.command.run({ command: 'salva', args: 'lembrete' })
+    await rodarSalva($)
   } catch {
     $.ui.toast('Não consegui rodar o /salva nesta conversa. Rode à mão.')
   }
 }
 
-// Só quem levou a fila até o fim chama: roda uma vez por fila.
-async function finalizar($: Api, r: Rodada | null) {
-  fim?.cancel()
-  fim = undefined
-  if (r) {
-    await update($, rodada, cur => (valida(cur)?.token === r.token ? null : cur))
-    const f = (await $.store.get('filaAtiva')) as FilaAtiva | null | undefined
-    if (f && f.token === r.token) await $.store.set('filaAtiva', null)
-    if (r.fila.length > 0) $.ui.toast(resumo(r.resultados))
+async function temSalva($: Api) {
+  try {
+    return (await $.command.list()).some((c: { name: string }) => c.name === 'salva')
+  } catch {
+    // Sem a lista, tenta: se o comando não existir, a vez fecha com erro.
+    return true
   }
+}
+
+function motivoDe(err: unknown) {
+  const m = err instanceof Error ? err.message : String(err)
+  return m.length > 80 ? `${m.slice(0, 77)}...` : m
+}
+
+// O /salva desta conversa rodando por causa da fila: { token, atual } da vez e, quando o turno
+// do /salva começa, o turnId dele. Só esse turno fecha a vez.
+let minhaVez: { token: string; atual: number; turnId?: string } | undefined
+
+// O /salva chega ao turno já expandido no prompt do comando, com a linha dos argumentos.
+// O turno que o comando /salva abre: digitado, expandido pelo app ou vindo da fila.
+// Uma mensagem que só cita o /salva no meio do texto não conta.
+function eTurnoDoSalva(texto: string) {
+  const t = texto.trim()
+  return (
+    /^\/salva\b/.test(t) ||
+    /<command-name>\/salva<\/command-name>/.test(t) ||
+    /^#\s*\/salva\b/m.test(t) ||
+    /ARGUMENTS:\s*lembrete/.test(t)
+  )
+}
+
+// Chegou a vez desta conversa: decide aqui mesmo e escreve a resposta na fila.
+async function fazerMinhaVez($: Api, f: FilaSalva) {
+  const g = await conferir($)
+  const t = await $.clock.now()
+  const ainda = (c: FilaSalva) => mesmaVez(c, f.token, f.atual, 'esperando')
+  if (!g.isRepo || !(await temSalva($))) {
+    await mudarFila($, ainda, c => avancada(c, 'sem salva aqui', t))
+    return
+  }
+  // As conversas dividem o repositório: git limpo não quer dizer que esta anotou as lições dela.
+  // "Já salvo" só se esta conversa rodou o /salva na última hora.
+  const ultimo = await read($, ultimoSalva)
+  if (ultimo > 0 && t - ultimo < SALVOU_HA_POUCO) {
+    await mudarFila($, ainda, c => avancada(c, 'já salvo', t))
+    return
+  }
+  const rodando = await mudarFila($, ainda, c => ({ ...c, estado: 'rodando', ateAtual: t + ESPERA }))
+  if (!rodando) return
+  minhaVez = { token: f.token, atual: f.atual }
+  // Sem esperar aqui: o relógio segue livre para dar sinal de vida enquanto o /salva roda.
+  void (async () => {
+    try {
+      await rodarSalva($)
+    } catch (err) {
+      minhaVez = undefined
+      const t2 = await $.clock.now()
+      await mudarFila($, c => mesmaVez(c, f.token, f.atual, 'rodando'), c => avancada(c, 'erro', t2, motivoDe(err)))
+    }
+  })()
+}
+
+// Fila no fim: só quem marcou "finalizando" salva, resume e apaga.
+async function finalizar($: Api, f: FilaSalva) {
+  const marcada = await mudarFila(
+    $,
+    c => c.token === f.token && c.atual >= c.fila.length && c.estado !== 'finalizando' && c.estado !== 'preparando',
+    c => ({ ...c, estado: 'finalizando' }),
+  )
+  if (!marcada) return
+  await mudarFila($, c => c.token === f.token, () => null)
+  if (marcada.fila.length > 0) $.ui.toast(resumo(marcada.resultados))
   await salvarEsta($)
 }
 
-// Passa a vez adiante, só se a vez ainda é `cod`. Devolve a rodada nova, ou nada se outro já passou.
-async function passarVez($: Api, cod: string, resultado: Omit<Resultado, 'conversa'>): Promise<Rodada | null> {
-  const feito: { r: Rodada | null } = { r: null }
-  await update($, rodada, cur => {
-    feito.r = null
-    const c = valida(cur)
-    if (!c || c.atual >= c.fila.length || codigo(c) !== cod) return cur
-    // ateAtual zerado: o relógio de 1 minuto não conta prazo antes do pedido seguinte chegar.
-    feito.r = {
-      ...c,
-      resultados: [...c.resultados, { conversa: c.fila[c.atual] ?? '', ...resultado }],
-      atual: c.atual + 1,
-      ateAtual: 0,
-    }
-    return feito.r
-  })
-  return feito.r
-}
+let ocupado = false
 
-// Manda o pedido pra conversa da vez; pedido que não chega pula pra próxima.
-async function avancar($: Api, inicio: Rodada) {
-  const para = await endereco($)
-  let r = inicio
-  while (r.atual < r.fila.length) {
-    const to = r.fila[r.atual] ?? ''
-    const cod = codigo(r)
-    let entregue = false
-    try {
-      entregue = (await $.session.send({ to, text: pedido(cod, para) })).isDelivered
-    } catch {}
-    if (entregue) {
-      const t = await $.clock.now()
-      const vez = r
-      const marcou = { ok: false }
-      await update($, rodada, cur => {
-        marcou.ok = false
-        const c = valida(cur)
-        if (!c || c.token !== vez.token || c.atual !== vez.atual) return cur
-        marcou.ok = true
-        return { ...c, ateAtual: t + ESPERA }
-      })
-      if (!marcou.ok) return
-      await $.store.set('filaAtiva', { token: r.token, ate: t + ESPERA })
-      fim?.cancel()
-      fim = $.clock.after(ESPERA, () => resolver($, cod, { resposta: 'sem resposta' }))
+// O relógio de cada conversa: lê a fila, faz a vez desta conversa e, na que coordena, cuida do prazo e do fim.
+async function tique($: Api) {
+  if (ocupado) return
+  ocupado = true
+  try {
+    const t = await $.clock.now()
+    const f = await lerFila($)
+    await guardarVista($, f)
+    if (!f) return
+
+    // Quem começou foi fechado: qualquer conversa apaga.
+    if (t > f.ateAtual + ABANDONADA) {
+      await mudarFila($, c => c.token === f.token && t > c.ateAtual + ABANDONADA, () => null)
       return
     }
-    const seguinte = await passarVez($, cod, { resposta: 'não entregue' })
-    if (!seguinte) return
-    r = seguinte
+    // Presa em preparando (a lista de conversas não voltou): desfaz sem salvar.
+    if (f.estado === 'preparando') {
+      if (t > f.ateAtual) await mudarFila($, c => c.token === f.token && c.estado === 'preparando', () => null)
+      return
+    }
+
+    // Sinal de vida: enquanto o /salva desta conversa roda, o prazo dela não vence.
+    const v = minhaVez
+    if (v && mesmaVez(f, v.token, v.atual, 'rodando')) {
+      await mudarFila($, c => mesmaVez(c, v.token, v.atual, 'rodando'), c => ({ ...c, ateAtual: t + ESPERA }))
+      return
+    }
+
+    const eu = await quemSou($, t)
+    const coordeno = f.token === (await read($, meuToken)) || (!!eu && f.coordenador === eu)
+    const vez = f.fila[f.atual]
+    if (eu && vez?.ref === eu && f.estado === 'esperando') {
+      await fazerMinhaVez($, f)
+      return
+    }
+    if (!coordeno) return
+    if (f.atual >= f.fila.length) {
+      await finalizar($, f)
+      return
+    }
+    if (t > f.ateAtual) {
+      await mudarFila($, c => mesmaVez(c, f.token, f.atual) && t > c.ateAtual, c => avancada(c, 'sem resposta', t))
+    }
+  } finally {
+    ocupado = false
   }
-  await finalizar($, r)
 }
 
-// Fecha a vez da conversa atual com a resposta dela e passa pra próxima.
-async function resolver($: Api, cod: string, resultado: Omit<Resultado, 'conversa'>) {
-  const seguinte = await passarVez($, cod, resultado)
-  if (!seguinte) return
-  fim?.cancel()
-  fim = undefined
-  // Pulada ou sem resposta: o pedido já está na fila dela; avisa pra não rodar junto com a próxima.
-  const to = seguinte.fila[seguinte.atual - 1]
-  if (to && (resultado.resposta === 'pulada' || resultado.resposta === 'sem resposta')) {
-    try {
-      await $.session.send({ to, text: cancelamento(cod) })
-    } catch {}
-  }
-  await avancar($, seguinte)
-}
+let comecando = false
 
-// Rede de segurança do prazo: se o timer se perdeu (o mod recarregou), o relógio de 1 minuto pula.
-async function conferirFila($: Api) {
-  const r = await lerRodada($)
-  if (!r || r.ateAtual <= 0 || (await $.clock.now()) <= r.ateAtual) return
-  if (r.fila.length > 0) return resolver($, codigo(r), { resposta: 'sem resposta' })
-  // Presa em preparando (a lista de conversas não voltou): desfaz sem salvar.
-  const desfeita = { ok: false }
-  await update($, rodada, cur => {
-    const c = valida(cur)
-    desfeita.ok = !!c && c.token === r.token && c.fila.length === 0
-    return desfeita.ok ? null : cur
-  })
-  if (!desfeita.ok) return
-  const f = (await $.store.get('filaAtiva')) as FilaAtiva | null | undefined
-  if (f && f.token === r.token) await $.store.set('filaAtiva', null)
+// Salvar agora: esta conversa monta a fila no store e salva por último.
+async function comecarFila($: Api) {
+  if (comecando) return
+  comecando = true
+  try {
+    const agora = await $.clock.now()
+    // Uma fila só: nem duas nesta conversa, nem uma por cima da fila de outra conversa.
+    const existente = await lerFila($)
+    if (existente && agora <= existente.ateAtual + ABANDONADA) return
+    const token = `SALVA-${agora.toString(36)}${Math.random().toString(36).slice(2, 6)}`
+    await update($, meuToken, () => token)
+    // A marca vai antes de perguntar quem está aberto, para as outras conversas já esconderem o botão.
+    const preparando: FilaSalva = {
+      token,
+      coordenador: await read($, meuRef),
+      fila: [],
+      atual: 0,
+      estado: 'preparando',
+      ateAtual: agora + ESPERA,
+      resultados: [],
+    }
+    await $.store.set(CHAVE, preparando)
+    await guardarVista($, preparando)
+    const { eu, outras } = await listar($)
+    const t = await $.clock.now()
+    if (!eu || outras.length === 0) {
+      // Sem outras conversas (ou sem saber quem esta é): salva só esta.
+      await mudarFila($, c => c.token === token, () => null)
+      await salvarEsta($)
+      return
+    }
+    const montada = await mudarFila(
+      $,
+      c => c.token === token && c.estado === 'preparando',
+      c => ({ ...c, coordenador: eu, fila: outras, estado: 'esperando', ateAtual: t + ESPERA }),
+    )
+    if (montada) await tique($)
+  } finally {
+    comecando = false
+  }
 }
 
 export const register: Register = on => {
@@ -290,16 +375,45 @@ export const register: Register = on => {
     const t = await $.clock.now()
     if ((await read($, startedAt)) === 0) await update($, startedAt, () => t)
     await atualizar($)
-    $.clock.every(MIN, async () => {
-      await atualizar($)
-      await conferirFila($)
-    })
+    $.clock.every(MIN, () => atualizar($))
+    $.clock.every(TIQUE, () => tique($))
+    return next(e)
+  })
+
+  // Marca qual turno é o do /salva da fila, para um turno que já rodava não fechar a vez antes.
+  on('turn.start', async ($, e, next) => {
+    if (e.agentId === undefined && eTurnoDoSalva(e.text)) {
+      const agora = await $.clock.now()
+      await update($, ultimoSalva, () => agora)
+    }
+    const v = minhaVez
+    if (v && !v.turnId && e.agentId === undefined && eTurnoDoSalva(e.text)) {
+      const f = await lerFila($)
+      if (f && mesmaVez(f, v.token, v.atual, 'rodando')) minhaVez = { ...v, turnId: e.turnId }
+    }
     return next(e)
   })
 
   on('turn.complete', async ($, e, next) => {
     const result = await next(e)
     await atualizar($)
+    // O turno do /salva da fila terminou: a vez desta conversa está feita.
+    const v = minhaVez
+    if (v && v.turnId && v.turnId === e.turnId) {
+      const f = await lerFila($)
+      if (!f || f.token !== v.token || f.atual !== v.atual || f.estado !== 'rodando') {
+        minhaVez = undefined
+      } else {
+        minhaVez = undefined
+        const t = await $.clock.now()
+        const ok = e.reason === 'answer'
+        await mudarFila(
+          $,
+          c => mesmaVez(c, v.token, v.atual, 'rodando'),
+          c => (ok ? avancada(c, 'pronto', t) : avancada(c, 'erro', t, 'o /salva foi interrompido')),
+        )
+      }
+    }
     return result
   })
 
@@ -313,52 +427,54 @@ export const register: Register = on => {
     return result
   }).catch(($, e, next) => (next.called ? undefined : next(e)))
 
-  on('session.receive', async ($, e, next) => {
-    const r = await lerRodada($)
-    if (!r || !e.text.includes(r.token)) {
-      // Resposta atrasada de uma fila que já acabou: não vai pro Claude.
-      if (RESPOSTA.test(e.text)) return { consumed: 'resposta atrasada ao pedido do lembrete do salva' }
-      return next(e)
-    }
-    const m = e.text.match(new RegExp(`${r.token}-(\\d+)`))
-    // Fora do gancho: o $.command.run do fim da fila é recusado dentro de um gancho que o turno espera.
-    if (m && Number(m[1]) === r.atual) {
-      const cod = codigo(r)
-      const resposta = classificar(e.text)
-      $.clock.after(0, () => resolver($, cod, resposta))
-    }
-    return { consumed: 'resposta ao pedido do lembrete do salva' }
-  }).catch(($, e, next) => (next.called ? undefined : next(e)))
-
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
     if (e.props.hasSurvey) return next(e)
 
-    const r = await lerRodada($)
-    if (r && r.fila.length === 0) {
-      const { Box, Text } = $.ui.resolve(e)
-      return (
-        <Box gap={1}>
-          <Text>Salvando em fila · preparando</Text>
-        </Box>
-      )
-    }
-    // Já passou da última: só falta esta conversa salvar. Sem Pular, que passaria a vez de novo.
-    if (r && r.atual >= r.fila.length) {
-      const { Box, Text } = $.ui.resolve(e)
-      return (
-        <Box gap={1}>
-          <Text>Salvando em fila · terminando</Text>
-        </Box>
-      )
-    }
-    if (r) {
+    const t = Math.max(await read($, now), await $.clock.now())
+    const vista = valida(await read($, filaVista))
+    const f = vista && t <= vista.ateAtual + ABANDONADA ? vista : null
+    const eu = await read($, meuRef)
+    const coordeno = !!f && (f.token === (await read($, meuToken)) || (!!eu && f.coordenador === eu))
+
+    if (f && coordeno) {
       const { Box, Button, Text } = $.ui.resolve(e)
+      if (f.estado === 'preparando')
+        return (
+          <Box gap={1}>
+            <Text>Salvando em fila · preparando</Text>
+          </Box>
+        )
+      // Já passou da última: só falta esta conversa salvar. Sem Pular, que passaria a vez de novo.
+      if (f.atual >= f.fila.length || f.estado === 'finalizando')
+        return (
+          <Box gap={1}>
+            <Text>Salvando em fila · terminando</Text>
+          </Box>
+        )
+      const { token, atual } = f
       return (
         <Box gap={1}>
           <Text>
-            Salvando em fila · {Math.min(r.atual + 1, r.fila.length)} de {r.fila.length} · agora: {nome(r.fila[r.atual] ?? '')}
+            Salvando em fila · {atual + 1} de {f.fila.length} · agora: {f.fila[atual]?.nome ?? ''}
           </Text>
-          <Button key="pular" label="Pular esta conversa" onPress={() => resolver($, codigo(r), { resposta: 'pulada' })} />
+          <Button
+            key="pular"
+            label="Pular esta conversa"
+            onPress={async () => {
+              const t2 = await $.clock.now()
+              await mudarFila($, c => mesmaVez(c, token, atual), c => avancada(c, 'pulada', t2))
+              await tique($)
+            }}
+          />
+        </Box>
+      )
+    }
+
+    if (f && eu && f.fila[f.atual]?.ref === eu) {
+      const { Box, Text } = $.ui.resolve(e)
+      return (
+        <Box gap={1}>
+          <Text>Salvando esta conversa (fila)</Text>
         </Box>
       )
     }
@@ -366,7 +482,6 @@ export const register: Register = on => {
     const g = await read($, git)
     if (!g.isRepo || (g.dirty === 0 && g.ahead === 0)) return next(e)
 
-    const t = Math.max(await read($, now), await $.clock.now())
     if (t < (await read($, snoozeUntil))) return next(e)
 
     // Sem GitHub ligado, conta desde o início da sessão.
@@ -375,7 +490,7 @@ export const register: Register = on => {
 
     const { Box, Button, Text } = $.ui.resolve(e)
 
-    if ((await read($, outraFila)) > t) {
+    if (f) {
       return (
         <Box gap={1}>
           <Text>Salvamento em fila rodando em outra conversa</Text>
@@ -386,42 +501,7 @@ export const register: Register = on => {
     return (
       <Box gap={1}>
         <Text>Faz {tempo(t - desde)} que você não salva · {pendente(g)}</Text>
-        <Button
-          key="salvar"
-          label="Salvar agora"
-          variant="primary"
-          onPress={async () => {
-            // Uma fila só: nem duas nesta conversa, nem uma por cima da fila de outra conversa.
-            if (await lerRodada($)) return
-            const agora = await $.clock.now()
-            const f = (await $.store.get('filaAtiva')) as FilaAtiva | null | undefined
-            if (f && typeof f.ate === 'number' && f.ate > agora) return
-            const token = `SALVA-${agora.toString(36)}`
-            const comecou = { ok: false }
-            await update($, rodada, cur => {
-              comecou.ok = false
-              if (valida(cur)) return cur
-              comecou.ok = true
-              // Com prazo: se a lista de conversas nunca voltar, o relógio desfaz esta fila.
-              return { token, fila: [], atual: 0, resultados: [], ateAtual: agora + ESPERA }
-            })
-            if (!comecou.ok) return
-            // A marca vai antes de perguntar quem está aberto, para as outras conversas já esconderem o botão.
-            await $.store.set('filaAtiva', { token, ate: agora + ESPERA })
-            const outras = await conversasAbertas($)
-            const pronta: { r: Rodada | null } = { r: null }
-            await update($, rodada, cur => {
-              pronta.r = null
-              const c = valida(cur)
-              if (!c || c.token !== token || c.fila.length > 0) return cur
-              pronta.r = { ...c, fila: outras, ateAtual: 0 }
-              return pronta.r
-            })
-            if (!pronta.r) return
-            if (outras.length === 0) return finalizar($, pronta.r)
-            await avancar($, pronta.r)
-          }}
-        />
+        <Button key="salvar" label="Salvar agora" variant="primary" onPress={() => comecarFila($)} />
         <Button
           key="depois"
           label="Depois"

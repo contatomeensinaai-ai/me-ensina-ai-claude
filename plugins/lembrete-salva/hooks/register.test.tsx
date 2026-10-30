@@ -35,9 +35,23 @@ function fakeGit(on: any, repo: Repo) {
   })
 }
 
-async function setup($: any, on: any, repo: Repo, extra?: (on: any) => void, loja?: Record<string, unknown>) {
+// O $.store de mentira, numa caixa que o teste também lê e escreve: as outras conversas
+// do app só existem para este mod pelo que deixam ali.
+type Loja = Record<string, unknown>
+
+async function setup($: any, on: any, repo: Repo, extra?: (on: any) => void, inicial?: Loja, comandos = ['salva']) {
   const clock = mock.clock(on, { now: T0 })
-  mock.store(on, loja)
+  const loja: Loja = { ...(inicial ?? {}) }
+  on('store.get', (_: unknown, e: { key: string }) => ({ value: loja[e.key] }))
+  on('store.set', (_: unknown, e: { key: string; value: unknown }) => {
+    loja[e.key] = JSON.parse(JSON.stringify(e.value))
+    return { value: undefined }
+  })
+  on('store.delete', (_: unknown, e: { key: string }) => {
+    delete loja[e.key]
+    return { value: undefined }
+  })
+  on('store.keys', () => ({ value: Object.keys(loja) }))
   fakeGit(on, repo)
   const submitted: string[] = []
   const toasts: string[] = []
@@ -45,17 +59,14 @@ async function setup($: any, on: any, repo: Repo, extra?: (on: any) => void, loj
     submitted.push(e.args ? `${e.command} ${e.args}` : e.command)
     return { text: '' }
   })
+  on('command.list', () => ({ value: comandos.map(name => ({ name, description: '', source: 'user' })) }))
+  on('turn.complete', () => ({ text: '' }))
+  on('turn.start', (_: unknown, e: { turnId: string }) => ({ turnId: e.turnId }))
   // Embaixo do mod, o desenho do próprio Claude: uma caixa vazia.
   on('ui.render', ($: any, e: any) => {
     const { Box } = $.ui.resolve(e)
     return <Box />
   })
-  on('session.receive', (_: unknown, e: { text: string }) => ({ text: e.text }))
-  // O endereço desta conversa no app (para onde as outras respondem).
-  on('env.get', (_: unknown, e: { name: string }) => ({
-    value: e.name === 'CLAUDE_CODE_HOST_SESSION_ID' ? 'local_coordenadora' : undefined,
-  }))
-  on('session.id', () => ({ value: 'cli-esta' }))
   extra?.(on)
   on('ui.toast', (_: unknown, e: unknown) => {
     toasts.push(typeof e === 'string' ? e : JSON.stringify(e))
@@ -64,7 +75,7 @@ async function setup($: any, on: any, repo: Repo, extra?: (on: any) => void, loj
   on('session.start', (_: unknown, e: { cwd: string }) => ({ cwd: e.cwd }))
   await $.session.start({ cwd: '/repo', surface: 'desktop', isInteractive: true })
   await clock.settle()
-  return { clock, submitted, toasts }
+  return { clock, submitted, toasts, loja }
 }
 
 async function bandText($: any): Promise<string | undefined> {
@@ -167,357 +178,6 @@ test('repositório sem GitHub ligado conta desde o início da sessão', async ($
   expect(await bandText($)).toBe('Faz 1h01 que você não salva · 2 arquivos fora do GitHub')
 })
 
-// Conversas abertas que o ListAgents devolve: duas no app (uma ocupada), uma na nuvem e uma desligada.
-const LISTA = {
-  listing: '',
-  sections: [
-    {
-      kind: 'peers',
-      total: 4,
-      rows: [
-        { name: 'Propostas', ref: 'aa11', type: 'Claude Desktop session', status: 'idle' },
-        { name: 'Conteúdo', ref: 'bb22', type: 'Claude Desktop session', status: 'busy' },
-        { name: 'Nuvem', ref: 'cc33', type: 'cloud', status: 'idle' },
-        { name: 'Velha', ref: 'dd44', type: 'Remote Control', status: 'offline' },
-      ],
-    },
-  ],
-}
-
-
-async function setupRodada($: any, on: any, entregue: (to: string) => boolean = () => true) {
-  const enviados: { to: string; text: string }[] = []
-  const r = await setup($, on, { isRepo: true, dirty: 3, ahead: 0, upstreamAt: OLD }, on => {
-    on('tool.call', (_: unknown, e: { tool: string }) =>
-      e.tool === 'ListAgents' ? { result: LISTA } : { result: { stdout: '', stderr: '', interrupted: false } },
-    )
-    on('session.send', (_: unknown, e: { to: string; text: string }) => {
-      enviados.push({ to: e.to, text: e.text })
-      return entregue(e.to) ? { isDelivered: true } : { isDelivered: false, reason: 'conversa fechada' }
-    })
-  })
-  await r.clock.advance(61 * MIN)
-  const ui = await $.ui.mount({ ...BAND, surface: 'desktop' })
-  await ui.press({ key: 'salvar' })
-  await ui.unmount()
-  await r.clock.settle()
-  const base = (enviados[0]?.text.match(/SALVA-[a-z0-9]+/) ?? [''])[0]
-  return { ...r, enviados, base }
-}
-
-async function textoDaFaixa($: any): Promise<string | undefined> {
-  const ui = await $.ui.mount({ ...BAND, surface: 'desktop' })
-  const found = await ui.find({ type: 'Text', text: /fila/ })
-  await ui.unmount()
-  return found?.text
-}
-
-// Só os pedidos: os avisos de cancelamento ficam de fora.
-function pedidos(enviados: { to: string; text: string }[]) {
-  return enviados.filter(x => !/^SALVA-[a-z0-9]+-\d+ cancelado:/.test(x.text))
-}
-
-function responder($: any, codigo: string, texto: string) {
-  return $.session.receive({ origin: { kind: 'peer-send-message' }, text: `${codigo}: ${texto}` })
-}
-
-test('Salvar agora pede só à primeira conversa da fila e espera', async ($, on) => {
-  const { enviados, submitted, base } = await setupRodada($, on)
-  expect(enviados.map(x => x.to)).toEqual(['Propostas [aa11]'])
-  expect(enviados[0]?.text).toContain(`${base}-0`)
-  expect(enviados[0]?.text).toContain('/salva lembrete')
-  expect(enviados[0]?.text).toContain('já salvo')
-  expect(enviados[0]?.text).toContain('sem salva aqui')
-  expect(submitted).toEqual([])
-  expect(await textoDaFaixa($)).toBe('Salvando em fila · 1 de 2 · agora: Propostas')
-})
-
-test('a próxima conversa só recebe o pedido depois que a anterior responde', async ($, on) => {
-  const { clock, enviados, base } = await setupRodada($, on)
-  const r1 = await responder($, `${base}-0`, 'pronto')
-  expect(JSON.stringify(r1)).toContain('consumed')
-  await clock.settle()
-  expect(enviados.map(x => x.to)).toEqual(['Propostas [aa11]', 'Conteúdo [bb22]'])
-  expect(enviados[1]?.text).toContain(`${base}-1`)
-  expect(await textoDaFaixa($)).toBe('Salvando em fila · 2 de 2 · agora: Conteúdo')
-})
-
-test('acabada a fila, esta conversa salva por último e mostra o resumo', async ($, on) => {
-  const { clock, submitted, toasts, base } = await setupRodada($, on)
-  await responder($, `${base}-0`, 'pronto')
-  await clock.settle()
-  expect(submitted).toEqual([])
-  await responder($, `${base}-1`, 'já salvo')
-  await clock.settle()
-  expect(submitted).toEqual(['salva lembrete'])
-  expect(toasts.some(t => t.includes('Salvamento em fila: 1 salva · 1 já estava salva'))).toBe(true)
-  expect(await textoDaFaixa($)).toBe(undefined)
-})
-
-test('"sem salva aqui" avança sem contar como salva', async ($, on) => {
-  const { clock, toasts, base } = await setupRodada($, on)
-  await responder($, `${base}-0`, 'sem salva aqui')
-  await clock.settle()
-  await responder($, `${base}-1`, 'pronto')
-  await clock.settle()
-  expect(toasts.some(t => t.includes('Salvamento em fila: 1 salva · 1 sem salva aqui'))).toBe(true)
-})
-
-test('5 minutos sem resposta pula pra próxima e o resumo diz qual', async ($, on) => {
-  const { clock, enviados, submitted, toasts, base } = await setupRodada($, on)
-  await clock.advance(5 * MIN + 1000)
-  expect(pedidos(enviados).map(x => x.to)).toEqual(['Propostas [aa11]', 'Conteúdo [bb22]'])
-  await responder($, `${base}-1`, 'pronto')
-  await clock.settle()
-  expect(submitted).toEqual(['salva lembrete'])
-  expect(toasts.some(t => t.includes('1 salva · 1 sem resposta: Propostas'))).toBe(true)
-})
-
-test('resposta atrasada da conversa pulada não conta pra conversa da vez', async ($, on) => {
-  const { clock, submitted, base } = await setupRodada($, on)
-  await clock.advance(5 * MIN + 1000)
-  const r = await responder($, `${base}-0`, 'pronto')
-  expect(JSON.stringify(r)).toContain('consumed')
-  await clock.settle()
-  expect(submitted).toEqual([])
-  expect(await textoDaFaixa($)).toBe('Salvando em fila · 2 de 2 · agora: Conteúdo')
-})
-
-test('pedido que não chega pula direto pra próxima', async ($, on) => {
-  const { enviados, base } = await setupRodada($, on, to => to !== 'Propostas [aa11]')
-  expect(enviados.map(x => x.to)).toEqual(['Propostas [aa11]', 'Conteúdo [bb22]'])
-  expect(enviados[1]?.text).toContain(`${base}-1`)
-  expect(await textoDaFaixa($)).toBe('Salvando em fila · 2 de 2 · agora: Conteúdo')
-})
-
-test('Pular esta conversa passa pra próxima e entra no resumo', async ($, on) => {
-  const { clock, enviados, toasts, base } = await setupRodada($, on)
-  const ui = await $.ui.mount({ ...BAND, surface: 'desktop' })
-  await ui.press({ key: 'pular' })
-  await ui.unmount()
-  await clock.settle()
-  expect(pedidos(enviados).map(x => x.to)).toEqual(['Propostas [aa11]', 'Conteúdo [bb22]'])
-  await responder($, `${base}-1`, 'pronto')
-  await clock.settle()
-  expect(toasts.some(t => t.includes('1 pulada: Propostas'))).toBe(true)
-})
-
-test('mensagem de outra conversa sem o código passa direto pro Claude', async ($, on) => {
-  await setupRodada($, on)
-  const r = await $.session.receive({ origin: { kind: 'peer-send-message' }, text: 'oi, terminei a proposta' })
-  expect(JSON.stringify(r)).not.toContain('consumed')
-})
-
-test('rodada guardada pela versão anterior é ignorada', async ($, on) => {
-  // O que a v1 guardou (sem fila) continua no estado depois da troca de código.
-  on('state.get', (_: unknown, e: any, next: any) =>
-    e?.key === 'rodada'
-      ? { value: { value: { token: 'SALVA-velho', pedidas: ['Propostas [aa11]'], respostas: [], ate: T0 }, version: 1 } }
-      : next(e),
-  )
-  const { clock } = await setup($, on, { isRepo: true, dirty: 3, ahead: 0, upstreamAt: OLD })
-  await clock.advance(MIN)
-  expect(await textoDaFaixa($)).toBe(undefined)
-  expect(await bandText($)).toBe('Faz 24h01 que você não salva · 3 arquivos fora do GitHub')
-})
-
-test('com fila rodando em outra conversa, a faixa não oferece Salvar agora', async ($, on) => {
-  // O $ do teste não tem $.store: a marca da outra conversa já está no store desde o início.
-  const { clock } = await setup($, on, { isRepo: true, dirty: 3, ahead: 0, upstreamAt: OLD }, undefined, {
-    filaAtiva: { token: 'SALVA-outra', ate: T0 + 3 * MIN },
-  })
-  await clock.advance(MIN)
-  const ui = await $.ui.mount({ ...BAND, surface: 'desktop' })
-  const aviso = await ui.find({ type: 'Text', text: /outra conversa/ })
-  await ui.unmount()
-  expect(aviso?.text).toBe('Salvamento em fila rodando em outra conversa')
-  expect(await bandText($)).toBe(undefined)
-  await clock.advance(3 * MIN)
-  expect(await bandText($)).toBe('Faz 24h04 que você não salva · 3 arquivos fora do GitHub')
-})
-
-test('dois cliques em Pular na primeira conversa mandam o pedido da próxima uma vez só', async ($, on) => {
-  const { clock, enviados } = await setupRodada($, on)
-  const ui = await $.ui.mount({ ...BAND, surface: 'desktop' })
-  const a = ui.press({ key: 'pular' })
-  const b = ui.press({ key: 'pular' }).catch(() => undefined)
-  await a
-  await b
-  await ui.unmount()
-  await clock.settle()
-  expect(pedidos(enviados).map(x => x.to)).toEqual(['Propostas [aa11]', 'Conteúdo [bb22]'])
-})
-
-test('dois cliques em Pular na última conversa salvam esta uma vez só', async ($, on) => {
-  const { clock, submitted, toasts, base } = await setupRodada($, on)
-  await responder($, `${base}-0`, 'pronto')
-  await clock.settle()
-  const ui = await $.ui.mount({ ...BAND, surface: 'desktop' })
-  const a = ui.press({ key: 'pular' })
-  const b = ui.press({ key: 'pular' }).catch(() => undefined)
-  await a
-  await b
-  await ui.unmount()
-  await clock.settle()
-  expect(submitted).toEqual(['salva lembrete'])
-  expect(toasts.filter(t => t.includes('Salvamento em fila')).length).toBe(1)
-})
-
-test('resposta junto com o prazo não pula duas conversas', async ($, on) => {
-  const { clock, enviados, submitted, base } = await setupRodada($, on)
-  await clock.advance(5 * MIN - 1)
-  const p = responder($, `${base}-0`, 'pronto')
-  await clock.advance(1000)
-  await p
-  await clock.settle()
-  expect(pedidos(enviados).map(x => x.to)).toEqual(['Propostas [aa11]', 'Conteúdo [bb22]'])
-  expect(submitted).toEqual([])
-})
-
-test('dois cliques em Salvar agora começam uma fila só', async ($, on) => {
-  const enviados: { to: string; text: string }[] = []
-  const r = await setup($, on, { isRepo: true, dirty: 3, ahead: 0, upstreamAt: OLD }, on => {
-    on('tool.call', (_: unknown, e: { tool: string }) =>
-      e.tool === 'ListAgents' ? { result: LISTA } : { result: { stdout: '', stderr: '', interrupted: false } },
-    )
-    on('session.send', (_: unknown, e: { to: string; text: string }) => {
-      enviados.push({ to: e.to, text: e.text })
-      return { isDelivered: true }
-    })
-  })
-  await r.clock.advance(61 * MIN)
-  const ui = await $.ui.mount({ ...BAND, surface: 'desktop' })
-  const a = ui.press({ key: 'salvar' })
-  const b = ui.press({ key: 'salvar' }).catch(() => undefined)
-  await a
-  await b
-  await ui.unmount()
-  await r.clock.settle()
-  expect(pedidos(enviados).map(x => x.to)).toEqual(['Propostas [aa11]'])
-  expect(r.submitted).toEqual([])
-})
-
-test('Salvar agora não faz nada se outra conversa marcou uma fila depois do último desenho', async ($, on) => {
-  let marca: unknown = undefined
-  on('store.get', { key: 'filaAtiva' }, (_: unknown, e: { key: string }, next: any) =>
-    e.key === 'filaAtiva' && marca ? { value: marca } : next(e),
-  )
-  const enviados: string[] = []
-  let listou = 0
-  const r = await setup($, on, { isRepo: true, dirty: 3, ahead: 0, upstreamAt: OLD }, on => {
-    on('tool.call', (_: unknown, e: { tool: string }) => {
-      if (e.tool === 'ListAgents') listou++
-      return e.tool === 'ListAgents' ? { result: LISTA } : { result: { stdout: '', stderr: '', interrupted: false } }
-    })
-    on('session.send', (_: unknown, e: { to: string }) => {
-      enviados.push(e.to)
-      return { isDelivered: true }
-    })
-  })
-  await r.clock.advance(61 * MIN)
-  const ui = await $.ui.mount({ ...BAND, surface: 'desktop' })
-  marca = { token: 'SALVA-outra', ate: T0 + 70 * MIN }
-  await ui.press({ key: 'salvar' })
-  await ui.unmount()
-  await r.clock.settle()
-  expect(listou).toBe(0)
-  expect(enviados).toEqual([])
-  expect(r.submitted).toEqual([])
-})
-
-test('a conversa que coordena marca a fila no store ao começar e limpa no fim', async ($, on) => {
-  const escritas: { key: string; value: unknown }[] = []
-  on('store.set', { key: 'filaAtiva' }, (_: unknown, e: { key: string; value: unknown }, next: any) => {
-    if (e.key === 'filaAtiva') escritas.push({ key: e.key, value: e.value })
-    return next(e)
-  })
-  const { clock, base } = await setupRodada($, on)
-  const primeira = escritas[0]?.value as { token?: string } | undefined
-  expect(primeira?.token).toBe(base)
-  await responder($, `${base}-0`, 'pronto')
-  await clock.settle()
-  await responder($, `${base}-1`, 'pronto')
-  await clock.settle()
-  expect(escritas[escritas.length - 1]?.value).toBe(null)
-})
-
-test('conversa que passou do prazo recebe o aviso de cancelamento', async ($, on) => {
-  const { clock, enviados, base } = await setupRodada($, on)
-  await clock.advance(5 * MIN + 1000)
-  const cancelamento = enviados.find(x => x.text.startsWith(`${base}-0 cancelado:`))
-  expect(cancelamento?.to).toBe('Propostas [aa11]')
-  expect(cancelamento?.text).toBe(
-    `${base}-0 cancelado: não rode o /salva agora; o que você tem fica para o próximo salvamento.`,
-  )
-})
-
-test('o pedido diz como cancelar e para onde responder', async ($, on) => {
-  const { enviados, base } = await setupRodada($, on)
-  expect(enviados[0]?.text).toContain(`${base}-0 cancelado`)
-  expect(enviados[0]?.text).toContain('SendMessage')
-  expect(enviados[0]?.text).toContain('local_coordenadora')
-})
-
-test('resposta atrasada depois do fim da fila não chega ao Claude', async ($, on) => {
-  const { clock, base } = await setupRodada($, on)
-  await responder($, `${base}-0`, 'pronto')
-  await clock.settle()
-  await responder($, `${base}-1`, 'pronto')
-  await clock.settle()
-  const r = await responder($, `${base}-0`, 'pronto')
-  expect(JSON.stringify(r)).toContain('consumed')
-})
-
-test('o pedido que chega de outra conversa não é engolido', async ($, on) => {
-  await setup($, on, { isRepo: true, dirty: 3, ahead: 0, upstreamAt: OLD })
-  const texto = 'SALVA-abc-0 Pedido automático do lembrete do salva: responda só "SALVA-abc-0: pronto".'
-  const r = await $.session.receive({ origin: { kind: 'peer-send-message' }, text: texto })
-  expect(JSON.stringify(r)).not.toContain('consumed')
-})
-
-test('"sem erros" conta como pronto, erro guarda o motivo e o resto é resposta estranha', async ($, on) => {
-  const enviados: { to: string; text: string }[] = []
-  const lista = {
-    listing: '',
-    sections: [
-      {
-        kind: 'peers',
-        total: 3,
-        rows: [
-          { name: 'A', ref: 'a1', type: 'Claude Desktop session', status: 'idle' },
-          { name: 'B', ref: 'b2', type: 'Claude Desktop session', status: 'idle' },
-          { name: 'C', ref: 'c3', type: 'Claude Desktop session', status: 'idle' },
-        ],
-      },
-    ],
-  }
-  const r = await setup($, on, { isRepo: true, dirty: 3, ahead: 0, upstreamAt: OLD }, on => {
-    on('tool.call', (_: unknown, e: { tool: string }) =>
-      e.tool === 'ListAgents' ? { result: lista } : { result: { stdout: '', stderr: '', interrupted: false } },
-    )
-    on('session.send', (_: unknown, e: { to: string; text: string }) => {
-      enviados.push({ to: e.to, text: e.text })
-      return { isDelivered: true }
-    })
-  })
-  await r.clock.advance(61 * MIN)
-  const ui = await $.ui.mount({ ...BAND, surface: 'desktop' })
-  await ui.press({ key: 'salvar' })
-  await ui.unmount()
-  await r.clock.settle()
-  const base = (enviados[0]?.text.match(/SALVA-[a-z0-9]+/) ?? [''])[0]
-  await responder($, `${base}-0`, 'pronto, sem erros')
-  await r.clock.settle()
-  await responder($, `${base}-1`, 'erro push recusado')
-  await r.clock.settle()
-  await responder($, `${base}-2`, 'hum, não entendi')
-  await r.clock.settle()
-  expect(
-    r.toasts.some(t =>
-      t.includes('Salvamento em fila: 1 salva · 1 erro: B (push recusado) · 1 resposta estranha: C'),
-    ),
-  ).toBe(true)
-})
 
 test('se o /salva desta conversa falhar, avisa pra rodar à mão', async ($, on) => {
   // Antes do setup: o primeiro registrado fica por fora.
@@ -533,67 +193,239 @@ test('se o /salva desta conversa falhar, avisa pra rodar à mão', async ($, on)
   expect(r.toasts.some(t => t.includes('Não consegui rodar o /salva nesta conversa. Rode à mão.'))).toBe(true)
 })
 
-test('relógio de 1 minuto não vence o prazo da próxima enquanto o pedido dela ainda está saindo', async ($, on) => {
-  const enviados: { to: string; text: string }[] = []
-  let primeiraConteudo = true
-  let solta: () => void = () => undefined
-  const r = await setup($, on, { isRepo: true, dirty: 3, ahead: 0, upstreamAt: OLD }, on => {
-    on('tool.call', (_: unknown, e: { tool: string }) =>
-      e.tool === 'ListAgents' ? { result: LISTA } : { result: { stdout: '', stderr: '', interrupted: false } },
-    )
-    on('session.send', async (_: unknown, e: { to: string; text: string }) => {
-      enviados.push({ to: e.to, text: e.text })
-      // O pedido da Conteúdo fica saindo até o teste soltar.
-      if (e.to.startsWith('Conteúdo') && primeiraConteudo) {
-        primeiraConteudo = false
-        await new Promise<void>(res => {
-          solta = res
-        })
-      }
+// O que o ListAgents devolve: esta conversa é a [ee55]; duas outras no app (uma ocupada),
+// uma na nuvem e uma desligada.
+const LISTA = {
+  listing: 'This session is Coordenadora [ee55]. The name other sessions use to reach it.',
+  sections: [
+    {
+      kind: 'peers',
+      total: 4,
+      rows: [
+        { name: 'Propostas', ref: 'aa11', type: 'interactive', status: 'idle' },
+        { name: 'Conteúdo', ref: 'bb22', type: 'interactive', status: 'busy' },
+        { name: 'Nuvem', ref: 'cc33', type: 'cloud', status: 'idle' },
+        { name: 'Velha', ref: 'dd44', type: 'interactive', status: 'offline' },
+      ],
+    },
+  ],
+}
+
+type Fila = {
+  token: string
+  coordenador: string
+  fila: { ref: string; nome: string }[]
+  atual: number
+  estado: string
+  ateAtual: number
+  resultados: { conversa: string; resposta: string; motivo?: string }[]
+}
+
+// Uma conversa com o ListAgents ligado e nenhuma mensagem entre conversas.
+function comLista(conta: { listou: number; enviados: string[] }, lista: unknown = LISTA) {
+  return (on: any) => {
+    on('tool.call', (_: unknown, e: { tool: string }) => {
+      if (e.tool !== 'ListAgents') return { result: { stdout: '', stderr: '', interrupted: false } }
+      conta.listou++
+      return { result: lista }
+    })
+    on('session.send', (_: unknown, e: { to: string }) => {
+      conta.enviados.push(e.to)
       return { isDelivered: true }
     })
-  })
+  }
+}
+
+async function setupCoordenadora($: any, on: any) {
+  const conta = { listou: 0, enviados: [] as string[] }
+  const r = await setup($, on, { isRepo: true, dirty: 3, ahead: 0, upstreamAt: OLD }, comLista(conta))
   await r.clock.advance(61 * MIN)
   const ui = await $.ui.mount({ ...BAND, surface: 'desktop' })
   await ui.press({ key: 'salvar' })
   await ui.unmount()
   await r.clock.settle()
-  await r.clock.advance(5 * MIN + 1000)
-  await r.clock.advance(2 * MIN)
-  solta()
+  const fila = () => r.loja.filaSalva as Fila | undefined
+  return { ...r, ...conta, fila }
+}
+
+async function textoDaFaixa($: any): Promise<string | undefined> {
+  const ui = await $.ui.mount({ ...BAND, surface: 'desktop' })
+  const found = await ui.find({ type: 'Text', text: /fila/ })
+  await ui.unmount()
+  return found?.text
+}
+
+async function pular($: any, vezes = 1) {
+  const ui = await $.ui.mount({ ...BAND, surface: 'desktop' })
+  const cliques = Array.from({ length: vezes }, () => ui.press({ key: 'pular' }).catch(() => undefined))
+  await Promise.all(cliques)
+  await ui.unmount()
+}
+
+// Uma fila que outra conversa ([cc99]) começou; esta conversa é a [ee55].
+function filaDeOutra(extra: Partial<Fila> = {}): Fila {
+  return {
+    token: 'SALVA-outra',
+    coordenador: 'cc99',
+    fila: [
+      { ref: 'ee55', nome: 'Esta' },
+      { ref: 'aa11', nome: 'Propostas' },
+    ],
+    atual: 0,
+    estado: 'esperando',
+    ateAtual: T0 + 5 * MIN,
+    resultados: [],
+    ...extra,
+  }
+}
+
+async function setupNaFila($: any, on: any, repo: Repo, fila: Fila = filaDeOutra(), comandos = ['salva']) {
+  const conta = { listou: 0, enviados: [] as string[] }
+  const r = await setup($, on, repo, comLista(conta), { filaSalva: fila }, comandos)
+  const atual = () => r.loja.filaSalva as Fila | undefined
+  return { ...r, ...conta, atual }
+}
+
+const SUJO = { isRepo: true, dirty: 3, ahead: 0, upstreamAt: OLD }
+const LIMPO = { isRepo: true, dirty: 0, ahead: 0, upstreamAt: T0 }
+const FIM_DE_TURNO = { answer: '', durationMs: 1000, isAborted: false, turnId: 't1', reason: 'answer' as const }
+// O /salva vira o prompt do comando, com a linha dos argumentos no fim.
+const TURNO_DO_SALVA = { text: 'Salvar a sessão atual.\n\nARGUMENTS: lembrete', turnId: 't-salva' }
+
+// ── Conversa que clicou em Salvar agora (coordena a fila) ──
+
+test('Salvar agora monta a fila no store, sem mandar mensagem a ninguém', async ($, on) => {
+  const { fila, enviados, submitted } = await setupCoordenadora($, on)
+  const f = fila()
+  expect(f?.coordenador).toBe('ee55')
+  expect(f?.fila).toEqual([
+    { ref: 'aa11', nome: 'Propostas' },
+    { ref: 'bb22', nome: 'Conteúdo' },
+  ])
+  expect(f?.atual).toBe(0)
+  expect(f?.estado).toBe('esperando')
+  expect(enviados).toEqual([])
+  expect(submitted).toEqual([])
+  expect(await textoDaFaixa($)).toBe('Salvando em fila · 1 de 2 · agora: Propostas')
+})
+
+test('conversa da vez que não termina em 5 minutos fica sem resposta e a fila anda', async ($, on) => {
+  const { clock, fila } = await setupCoordenadora($, on)
+  await clock.advance(5 * MIN + 10_000)
+  expect(fila()?.atual).toBe(1)
+  expect(fila()?.resultados).toEqual([{ conversa: 'Propostas', resposta: 'sem resposta' }])
+  expect(await textoDaFaixa($)).toBe('Salvando em fila · 2 de 2 · agora: Conteúdo')
+})
+
+test('fila no fim: esta conversa salva por último, resume e apaga a fila', async ($, on) => {
+  const { clock, fila, loja, submitted, toasts } = await setupCoordenadora($, on)
+  const f = fila() as Fila
+  loja.filaSalva = {
+    ...f,
+    atual: 2,
+    resultados: [
+      { conversa: 'Propostas', resposta: 'pronto' },
+      { conversa: 'Conteúdo', resposta: 'já salvo' },
+    ],
+  }
+  await clock.advance(10_000)
+  expect(submitted).toEqual(['salva lembrete'])
+  expect(toasts.filter(t => t.includes('Salvamento em fila: 1 salva · 1 já estava salva')).length).toBe(1)
+  expect(loja.filaSalva).toBe(undefined)
+  expect(await textoDaFaixa($)).toBe(undefined)
+})
+
+test('o resumo diz quem ficou de fora e o motivo do erro', async ($, on) => {
+  const { clock, fila, loja, toasts } = await setupCoordenadora($, on)
+  const f = fila() as Fila
+  loja.filaSalva = {
+    ...f,
+    fila: [...f.fila, { ref: 'x1', nome: 'B' }, { ref: 'x2', nome: 'C' }],
+    atual: 4,
+    resultados: [
+      { conversa: 'Propostas', resposta: 'pronto' },
+      { conversa: 'Conteúdo', resposta: 'sem salva aqui' },
+      { conversa: 'B', resposta: 'erro', motivo: 'push recusado' },
+      { conversa: 'C', resposta: 'pulada' },
+    ],
+  }
+  await clock.advance(10_000)
+  expect(
+    toasts.some(t => t.includes('Salvamento em fila: 1 salva · 1 sem salva aqui · 1 erro: B (push recusado) · 1 pulada: C')),
+  ).toBe(true)
+})
+
+test('Pular passa a vez da conversa atual', async ($, on) => {
+  const { clock, fila } = await setupCoordenadora($, on)
+  await pular($)
+  await clock.settle()
+  expect(fila()?.atual).toBe(1)
+  expect(fila()?.resultados).toEqual([{ conversa: 'Propostas', resposta: 'pulada' }])
+})
+
+test('dois cliques em Pular na primeira conversa pulam uma só', async ($, on) => {
+  const { clock, fila } = await setupCoordenadora($, on)
+  await pular($, 2)
+  await clock.settle()
+  expect(fila()?.atual).toBe(1)
+  expect(fila()?.resultados.length).toBe(1)
+})
+
+test('dois cliques em Pular na última conversa salvam esta uma vez só', async ($, on) => {
+  const { clock, fila, loja, submitted, toasts } = await setupCoordenadora($, on)
+  const f = fila() as Fila
+  loja.filaSalva = { ...f, atual: 1, resultados: [{ conversa: 'Propostas', resposta: 'pronto' }] }
+  await clock.advance(10_000)
+  expect(await textoDaFaixa($)).toBe('Salvando em fila · 2 de 2 · agora: Conteúdo')
+  await pular($, 2)
+  await clock.advance(30_000)
+  expect(submitted).toEqual(['salva lembrete'])
+  expect(toasts.filter(t => t.includes('Salvamento em fila')).length).toBe(1)
+})
+
+test('dois cliques em Salvar agora começam uma fila só', async ($, on) => {
+  const conta = { listou: 0, enviados: [] as string[] }
+  const r = await setup($, on, SUJO, comLista(conta))
+  await r.clock.advance(61 * MIN)
+  const ui = await $.ui.mount({ ...BAND, surface: 'desktop' })
+  await Promise.all([ui.press({ key: 'salvar' }), ui.press({ key: 'salvar' }).catch(() => undefined)])
+  await ui.unmount()
   await r.clock.settle()
-  expect(pedidos(enviados).map(x => x.to)).toEqual(['Propostas [aa11]', 'Conteúdo [bb22]'])
+  expect(conta.listou).toBe(1)
+  expect((r.loja.filaSalva as Fila | undefined)?.atual).toBe(0)
+})
+
+test('Salvar agora não faz nada se outra conversa começou uma fila depois do último desenho', async ($, on) => {
+  const conta = { listou: 0, enviados: [] as string[] }
+  const r = await setup($, on, SUJO, comLista(conta))
+  await r.clock.advance(61 * MIN)
+  const ui = await $.ui.mount({ ...BAND, surface: 'desktop' })
+  r.loja.filaSalva = filaDeOutra({ fila: [{ ref: 'aa11', nome: 'Propostas' }], ateAtual: T0 + 65 * MIN })
+  await ui.press({ key: 'salvar' })
+  await ui.unmount()
+  await r.clock.settle()
+  expect(conta.listou).toBe(0)
+  expect((r.loja.filaSalva as Fila).token).toBe('SALVA-outra')
   expect(r.submitted).toEqual([])
-  await r.clock.advance(10 * MIN)
+})
+
+test('sem outras conversas no app, salva na hora e não deixa fila', async ($, on) => {
+  const conta = { listou: 0, enviados: [] as string[] }
+  const r = await setup($, on, SUJO, comLista(conta, { listing: LISTA.listing, sections: [] }))
+  await r.clock.advance(61 * MIN)
+  const ui = await $.ui.mount({ ...BAND, surface: 'desktop' })
+  await ui.press({ key: 'salvar' })
+  await ui.unmount()
   await r.clock.settle()
   expect(r.submitted).toEqual(['salva lembrete'])
-  expect(r.toasts.filter(t => t.includes('Salvamento em fila')).length).toBe(1)
+  expect(r.loja.filaSalva).toBe(undefined)
 })
 
 test('depois da última conversa, a faixa diz terminando e não oferece Pular', async ($, on) => {
-  // Estado entre resolver a última conversa e o fim da fila, guardado aqui no teste (leitura e escrita).
-  const caixa: { value: unknown; version: number } = {
-    value: {
-      token: 'SALVA-fim',
-      fila: ['Propostas [aa11]'],
-      atual: 1,
-      resultados: [{ conversa: 'Propostas [aa11]', resposta: 'pronto' }],
-      ateAtual: 0,
-    },
-    version: 1,
-  }
-  on('state.get', (_: unknown, e: any, next: any) =>
-    e?.key === 'rodada' ? { value: { value: caixa.value, version: caixa.version } } : next(e),
-  )
-  on('state.set', (_: unknown, e: any, next: any) => {
-    if (e?.key !== 'rodada') return next(e)
-    if (e.ifVersion !== undefined && e.ifVersion !== caixa.version) return { value: { isSet: false, version: caixa.version } }
-    caixa.value = e.value
-    caixa.version++
-    return { value: { isSet: true, version: caixa.version } }
-  })
-  const { clock, submitted } = await setup($, on, { isRepo: true, dirty: 3, ahead: 0, upstreamAt: OLD })
-  await clock.advance(MIN)
+  const { clock, fila, loja, submitted } = await setupCoordenadora($, on)
+  const f = fila() as Fila
+  loja.filaSalva = { ...f, atual: 2, estado: 'finalizando' }
+  await clock.advance(10_000)
   expect(await textoDaFaixa($)).toBe('Salvando em fila · terminando')
   const ui = await $.ui.mount({ ...BAND, surface: 'desktop' })
   let recusado = false
@@ -602,21 +434,12 @@ test('depois da última conversa, a faixa diz terminando e não oferece Pular', 
   })
   await ui.unmount()
   expect(recusado).toBe(true)
-  // Uma resposta com o código da posição depois da última também não passa a vez de novo.
-  await responder($, 'SALVA-fim-1', 'pronto')
-  await clock.settle()
   expect(submitted).toEqual([])
-  expect((caixa.value as { atual: number }).atual).toBe(1)
 })
 
-test('fila presa em preparando é desfeita pelo relógio depois de 5 minutos', async ($, on) => {
+test('fila presa em preparando é desfeita depois de 5 minutos', async ($, on) => {
   let solta: () => void = () => undefined
-  const escritas: unknown[] = []
-  on('store.set', { key: 'filaAtiva' }, (_: unknown, e: { key: string; value: unknown }, next: any) => {
-    escritas.push(e.value)
-    return next(e)
-  })
-  const r = await setup($, on, { isRepo: true, dirty: 3, ahead: 0, upstreamAt: OLD }, on => {
+  const r = await setup($, on, SUJO, on => {
     on('tool.call', async (_: unknown, e: { tool: string }) => {
       if (e.tool === 'ListAgents') {
         // Quem pediu a lista foi cortado: a resposta não volta enquanto o teste não soltar.
@@ -627,7 +450,6 @@ test('fila presa em preparando é desfeita pelo relógio depois de 5 minutos', a
       }
       return { result: { stdout: '', stderr: '', interrupted: false } }
     })
-    on('session.send', () => ({ isDelivered: true }))
   })
   await r.clock.advance(61 * MIN)
   const ui = await $.ui.mount({ ...BAND, surface: 'desktop' })
@@ -635,18 +457,238 @@ test('fila presa em preparando é desfeita pelo relógio depois de 5 minutos', a
   await r.clock.advance(1000)
   expect(await textoDaFaixa($)).toBe('Salvando em fila · preparando')
   await r.clock.advance(6 * MIN)
+  expect(r.loja.filaSalva).toBe(undefined)
   expect(await textoDaFaixa($)).toBe(undefined)
-  expect(escritas[escritas.length - 1]).toBe(null)
   solta()
   await clique
   await ui.unmount()
   await r.clock.settle()
   expect(r.submitted).toEqual([])
+  expect(r.loja.filaSalva).toBe(undefined)
 })
 
-test('sem o endereço do app, o pedido usa o id da sessão', async ($, on) => {
-  // Antes do setup: o primeiro registrado fica por fora.
-  on('env.get', { name: 'CLAUDE_CODE_HOST_SESSION_ID' }, () => ({ value: '' }))
-  const { enviados } = await setupRodada($, on)
-  expect(enviados[0]?.text).toContain('"cli-esta"')
+// ── Conversa que está na fila de outra ──
+
+test('na vez desta conversa, com trabalho não salvo, roda o /salva lembrete uma vez', async ($, on) => {
+  const { clock, submitted, atual, enviados } = await setupNaFila($, on, SUJO)
+  await clock.advance(10_000)
+  expect(submitted).toEqual(['salva lembrete'])
+  expect(atual()?.estado).toBe('rodando')
+  expect(atual()?.atual).toBe(0)
+  const ui = await $.ui.mount({ ...BAND, surface: 'desktop' })
+  const aviso = await ui.find({ type: 'Text', text: /esta conversa/ })
+  await ui.unmount()
+  expect(aviso?.text).toBe('Salvando esta conversa (fila)')
+  await clock.advance(60_000)
+  expect(submitted).toEqual(['salva lembrete'])
+  expect(enviados).toEqual([])
+})
+
+test('quando o turno do /salva termina, marca pronto e passa a vez', async ($, on) => {
+  const { clock, atual } = await setupNaFila($, on, SUJO)
+  await clock.advance(10_000)
+  await $.turn.start(TURNO_DO_SALVA)
+  await $.turn.complete({ ...FIM_DE_TURNO, turnId: 't-salva' })
+  await clock.settle()
+  expect(atual()?.atual).toBe(1)
+  expect(atual()?.estado).toBe('esperando')
+  expect(atual()?.resultados).toEqual([{ conversa: 'Esta', resposta: 'pronto' }])
+})
+
+test('fim de turno sem /salva da fila não mexe na fila', async ($, on) => {
+  const { clock, atual } = await setupNaFila($, on, SUJO, filaDeOutra({ atual: 1 }))
+  await clock.advance(10_000)
+  await $.turn.complete(FIM_DE_TURNO)
+  await clock.settle()
+  expect(atual()?.atual).toBe(1)
+  expect(atual()?.resultados).toEqual([])
+})
+
+test('pasta limpa, mas sem /salva nesta conversa na última hora: roda o /salva', async ($, on) => {
+  // As conversas dividem o repositório: git limpo não quer dizer que esta já anotou as lições dela.
+  const { clock, submitted, atual } = await setupNaFila($, on, LIMPO)
+  await clock.advance(10_000)
+  expect(submitted).toEqual(['salva lembrete'])
+  expect(atual()?.estado).toBe('rodando')
+})
+
+// Esta conversa rodou o /salva `minutos` atrás e só então outra conversa começou a fila.
+async function salvaHa($: any, on: any, minutos: number) {
+  const conta = { listou: 0, enviados: [] as string[] }
+  const r = await setup($, on, LIMPO, comLista(conta))
+  await $.turn.start(TURNO_DO_SALVA)
+  await $.turn.complete({ ...FIM_DE_TURNO, turnId: 't-salva' })
+  await r.clock.advance(minutos * MIN)
+  r.loja.filaSalva = filaDeOutra({ ateAtual: T0 + (minutos + 5) * MIN })
+  await r.clock.advance(10_000)
+  return { ...r, atual: () => r.loja.filaSalva as Fila | undefined }
+}
+
+test('/salva nesta conversa há 20 minutos: responde já salvo sem rodar', async ($, on) => {
+  const { submitted, atual } = await salvaHa($, on, 20)
+  expect(submitted).toEqual([])
+  expect(atual()?.resultados).toEqual([{ conversa: 'Esta', resposta: 'já salvo' }])
+})
+
+test('/salva nesta conversa há 70 minutos: roda de novo', async ($, on) => {
+  const { submitted, atual } = await salvaHa($, on, 70)
+  expect(submitted).toEqual(['salva lembrete'])
+  expect(atual()?.estado).toBe('rodando')
+})
+
+test('mensagem que só cita o /salva não conta como salvamento desta conversa', async ($, on) => {
+  const conta = { listou: 0, enviados: [] as string[] }
+  const r = await setup($, on, LIMPO, comLista(conta))
+  await $.turn.start({ text: 'depois a gente roda o /salva, beleza?', turnId: 't-conversa' })
+  await $.turn.complete({ ...FIM_DE_TURNO, turnId: 't-conversa' })
+  await r.clock.advance(10 * MIN)
+  r.loja.filaSalva = filaDeOutra({ ateAtual: T0 + 15 * MIN })
+  await r.clock.advance(10_000)
+  expect(r.submitted).toEqual(['salva lembrete'])
+})
+
+test('/salva digitado conta como salvamento desta conversa', async ($, on) => {
+  const conta = { listou: 0, enviados: [] as string[] }
+  const r = await setup($, on, LIMPO, comLista(conta))
+  await $.turn.start({ text: '<command-name>/salva</command-name>\n# /salva — Salvar progresso', turnId: 't-manual' })
+  await $.turn.complete({ ...FIM_DE_TURNO, turnId: 't-manual' })
+  await r.clock.advance(10 * MIN)
+  r.loja.filaSalva = filaDeOutra({ ateAtual: T0 + 15 * MIN })
+  await r.clock.advance(10_000)
+  expect(r.submitted).toEqual([])
+  expect((r.loja.filaSalva as any)?.resultados).toEqual([{ conversa: 'Esta', resposta: 'já salvo' }])
+})
+
+test('fora de um repositório git responde sem salva aqui', async ($, on) => {
+  const { clock, submitted, atual } = await setupNaFila($, on, { isRepo: false, dirty: 0, ahead: 0, upstreamAt: 0 })
+  await clock.advance(10_000)
+  expect(submitted).toEqual([])
+  expect(atual()?.resultados).toEqual([{ conversa: 'Esta', resposta: 'sem salva aqui' }])
+})
+
+test('sem o comando salva na pasta responde sem salva aqui', async ($, on) => {
+  const { clock, submitted, atual } = await setupNaFila($, on, SUJO, filaDeOutra(), ['review'])
+  await clock.advance(10_000)
+  expect(submitted).toEqual([])
+  expect(atual()?.resultados).toEqual([{ conversa: 'Esta', resposta: 'sem salva aqui' }])
+})
+
+test('se o /salva não começa, a vez fecha com erro e o motivo', async ($, on) => {
+  on('command.run', { command: 'salva' }, () => {
+    throw new Error('recusado')
+  })
+  const { clock, atual } = await setupNaFila($, on, SUJO)
+  await clock.advance(10_000)
+  const r = atual()?.resultados[0]
+  expect(r?.resposta).toBe('erro')
+  // O kit entrega o erro do gancho com o texto dele, não o 'recusado' do teste.
+  expect(typeof r?.motivo === 'string' && r.motivo.length > 0).toBe(true)
+  expect(atual()?.atual).toBe(1)
+})
+
+test('fila de outra conversa: a faixa avisa e não oferece Salvar agora', async ($, on) => {
+  const { clock } = await setupNaFila(
+    $,
+    on,
+    SUJO,
+    filaDeOutra({ fila: [{ ref: 'aa11', nome: 'Propostas' }, { ref: 'ee55', nome: 'Esta' }], ateAtual: T0 + 70 * MIN }),
+  )
+  await clock.advance(MIN)
+  const ui = await $.ui.mount({ ...BAND, surface: 'desktop' })
+  const aviso = await ui.find({ type: 'Text', text: /outra conversa/ })
+  await ui.unmount()
+  expect(aviso?.text).toBe('Salvamento em fila rodando em outra conversa')
+  expect(await bandText($)).toBe(undefined)
+})
+
+test('fila abandonada há mais de 15 minutos é apagada e a faixa volta', async ($, on) => {
+  const { clock, loja } = await setupNaFila(
+    $,
+    on,
+    SUJO,
+    filaDeOutra({ fila: [{ ref: 'aa11', nome: 'Propostas' }], ateAtual: T0 - 16 * MIN }),
+  )
+  await clock.advance(10_000)
+  expect(loja.filaSalva).toBe(undefined)
+  expect(await bandText($)).toBe('Faz 24h00 que você não salva · 3 arquivos fora do GitHub')
+})
+
+test('marca e rodada da versão anterior são ignoradas', async ($, on) => {
+  // O que a v0.3 guardou: a marca filaAtiva no store e a rodada no estado.
+  on('state.get', (_: unknown, e: any, next: any) =>
+    e?.key === 'rodada'
+      ? { value: { value: { token: 'SALVA-velho', fila: ['Propostas [aa11]'], atual: 0, resultados: [], ateAtual: T0 }, version: 1 } }
+      : next(e),
+  )
+  const { clock } = await setup($, on, SUJO, undefined, { filaAtiva: { token: 'SALVA-velho', ate: T0 + 60 * MIN } })
+  await clock.advance(MIN)
+  expect(await textoDaFaixa($)).toBe(undefined)
+  expect(await bandText($)).toBe('Faz 24h01 que você não salva · 3 arquivos fora do GitHub')
+})
+
+test('turno que termina antes do turno do /salva começar não marca pronto', async ($, on) => {
+  const { clock, atual } = await setupNaFila($, on, SUJO)
+  await clock.advance(10_000)
+  await $.turn.complete({ ...FIM_DE_TURNO, turnId: 't-antigo' })
+  await clock.settle()
+  expect(atual()?.atual).toBe(0)
+  expect(atual()?.estado).toBe('rodando')
+  // E o turno do /salva, que vem depois, ainda fecha a vez.
+  await $.turn.start(TURNO_DO_SALVA)
+  await $.turn.complete({ ...FIM_DE_TURNO, turnId: 't-salva' })
+  await clock.settle()
+  expect(atual()?.resultados).toEqual([{ conversa: 'Esta', resposta: 'pronto' }])
+})
+
+test('turno de subagente com o texto do /salva é ignorado', async ($, on) => {
+  const { clock, atual } = await setupNaFila($, on, SUJO)
+  await clock.advance(10_000)
+  await $.turn.start({ ...TURNO_DO_SALVA, turnId: 't-sub', agentId: 'ag1' })
+  await $.turn.complete({ ...FIM_DE_TURNO, turnId: 't-sub', agentId: 'ag1' })
+  await clock.settle()
+  expect(atual()?.atual).toBe(0)
+  expect(atual()?.estado).toBe('rodando')
+})
+
+test('turno do /salva interrompido fecha a vez com erro', async ($, on) => {
+  const { clock, atual } = await setupNaFila($, on, SUJO)
+  await clock.advance(10_000)
+  await $.turn.start(TURNO_DO_SALVA)
+  await $.turn.complete({ ...FIM_DE_TURNO, turnId: 't-salva', isAborted: true, reason: 'aborted' as const })
+  await clock.settle()
+  expect(atual()?.resultados).toEqual([{ conversa: 'Esta', resposta: 'erro', motivo: 'o /salva foi interrompido' }])
+  expect(atual()?.atual).toBe(1)
+})
+
+test('enquanto o /salva desta conversa roda, o prazo dela não vence (sinal de vida a cada 5 s)', async ($, on) => {
+  const { clock, atual } = await setupNaFila($, on, SUJO)
+  await clock.advance(10_000)
+  expect(atual()?.estado).toBe('rodando')
+  await clock.advance(10 * MIN)
+  expect(atual()?.estado).toBe('rodando')
+  expect((atual()?.ateAtual ?? 0) > T0 + 10 * MIN).toBe(true)
+})
+
+test('quem coordena não pula a conversa que segue dando sinal de vida', async ($, on) => {
+  const { clock, fila, loja } = await setupCoordenadora($, on)
+  const f = fila() as Fila
+  loja.filaSalva = { ...f, estado: 'rodando' }
+  // A outra conversa renova o prazo a cada minuto, por 10 minutos.
+  for (let i = 0; i < 10; i++) {
+    await clock.advance(MIN)
+    const agora = T0 + 61 * MIN + (i + 1) * MIN
+    loja.filaSalva = { ...(loja.filaSalva as Fila), ateAtual: agora + 5 * MIN }
+  }
+  await clock.advance(10_000)
+  expect(fila()?.atual).toBe(0)
+  expect(fila()?.estado).toBe('rodando')
+})
+
+test('quem coordena pula a conversa que parou de dar sinal de vida depois de 5 minutos', async ($, on) => {
+  const { clock, fila, loja } = await setupCoordenadora($, on)
+  const f = fila() as Fila
+  loja.filaSalva = { ...f, estado: 'rodando' }
+  await clock.advance(5 * MIN + 10_000)
+  expect(fila()?.atual).toBe(1)
+  expect(fila()?.resultados).toEqual([{ conversa: 'Propostas', resposta: 'sem resposta' }])
 })

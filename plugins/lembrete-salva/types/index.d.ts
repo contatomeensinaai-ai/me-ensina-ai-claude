@@ -1,24 +1,27 @@
-// Como uma conversa da fila respondeu (ou o que aconteceu com ela).
+// Como a vez de uma conversa da fila terminou.
 export type Resultado = {
   conversa: string
   resposta: string
-  // O motivo que a conversa deu junto com "erro".
+  // O motivo, quando a resposta é "erro".
   motivo?: string
 }
 
-// A fila do Salvar agora, guardada na conversa que clicou.
-export type Rodada = {
-  token: string
-  fila: string[]
-  atual: number
-  resultados: Resultado[]
-  ateAtual: number
+// Uma conversa da fila: o ref que o ListAgents mostra e o nome dela.
+export type Vaga = {
+  ref: string
+  nome: string
 }
 
-// Marca no $.store, vista por todas as conversas, enquanto uma fila roda.
-export type FilaAtiva = {
+// A fila do Salvar agora, no $.store, que todas as conversas do app leem e escrevem.
+// Cada conversa roda o próprio /salva quando chega a vez dela.
+export type FilaSalva = {
   token: string
-  ate: number
+  coordenador: string
+  fila: Vaga[]
+  atual: number
+  estado: 'preparando' | 'esperando' | 'rodando' | 'finalizando'
+  ateAtual: number
+  resultados: Resultado[]
 }
 
 export type Git = {
@@ -36,8 +39,13 @@ declare module 'claude-code' {
       savedAt: number
       snoozeUntil: number
       now: number
-      rodada: Rodada | null
-      outraFila: number
+      // Cópia da fila do $.store, para a faixa desenhar sem ler o store.
+      fila: FilaSalva | null
+      // Quem esta conversa é no ListAgents, e o token da fila que ela começou.
+      meuRef: string
+      meuToken: string
+      // Quando esta conversa rodou o /salva pela última vez (à mão ou pela fila).
+      ultimoSalva: number
     }
   }
 }
