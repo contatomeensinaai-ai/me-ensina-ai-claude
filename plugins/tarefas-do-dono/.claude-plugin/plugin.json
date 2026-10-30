@@ -1,0 +1,10 @@
+{
+  "name": "tarefas-do-dono",
+  "version": "1.0.0",
+  "description": "Painel Suas tarefas ao lado do chat: o que só o dono pode fazer, anotado pelo Claude, com os botões Ativar e Feito. A lista é a mesma em todas as conversas do computador.",
+  "types": "./types/index.d.ts",
+  "license": "MIT",
+  "author": {
+    "name": "Me Ensina AI"
+  }
+}

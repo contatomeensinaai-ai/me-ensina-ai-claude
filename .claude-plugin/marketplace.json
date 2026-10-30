@@ -4,13 +4,18 @@
     "name": "Me Ensina AI"
   },
   "metadata": {
-    "description": "Marketplace exclusivo Claude Code: Me Ensina AI Editor de Vídeo"
+    "description": "Marketplace exclusivo Claude Code da Me Ensina AI: Editor de Vídeo e o mod Tarefas do dono"
   },
   "plugins": [
     {
       "name": "me-ensina-ai-video-editor",
       "source": "./plugins/me-ensina-ai-video-editor",
       "description": "Editor de vídeo local que abre dentro da conversa do Claude Code. Mac Apple Silicon, Mac Intel e Windows x64."
+    },
+    {
+      "name": "tarefas-do-dono",
+      "source": "./plugins/tarefas-do-dono",
+      "description": "Painel Suas tarefas ao lado do chat, com Ativar e Feito. Mesma lista em todas as conversas do computador."
     }
   ]
 }
